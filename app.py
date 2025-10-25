@@ -8,6 +8,124 @@ from typing import Deque, List, Optional, Tuple, Dict
 import pandas as pd
 from zoneinfo import ZoneInfo
 
+
+def _maybe_trustee_plus(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Additive, non-breaking mapper for Trustee Plus .xls exports.
+    If columns match the Trustee Plus shape, populate the standard fields the bot expects.
+    Otherwise, return df unchanged.
+    """
+    try:
+        cols = set(map(str, df.columns))
+    except Exception:
+        try:
+            cols = set(df.columns.astype(str))
+        except Exception:
+            return df
+    needed = {"Date","Type","Status","Amount","Currency code","Currency code after swap","Rate"}
+    if not needed.issubset(cols):
+        return df
+    out = df.copy()
+    if "Created Time" not in out.columns and "Date" in out.columns:
+        out["Created Time"] = out["Date"]
+    if "Order Type" not in out.columns and "Type" in out.columns:
+        _side = out["Type"].astype(str).str.upper().str.strip()
+        out["Order Type"] = _side.replace({"DEPOSIT":"Buy","WITHDRAW":"Sell"})
+    if "Asset Type" not in out.columns and "Currency code" in out.columns:
+        out["Asset Type"] = out["Currency code"]
+    if "Fiat Type" not in out.columns and "Currency code after swap" in out.columns:
+        out["Fiat Type"] = out["Currency code after swap"]
+    if "Quantity" not in out.columns and "Amount" in out.columns:
+        out["Quantity"] = pd.to_numeric(out["Amount"], errors="coerce").abs()
+    if "Price" not in out.columns and "Rate" in out.columns:
+        out["Price"] = pd.to_numeric(out["Rate"], errors="coerce")
+    if "Total Price" not in out.columns and {"Quantity","Price"}.issubset(out.columns):
+        out["Total Price"] = pd.to_numeric(out["Quantity"], errors="coerce").abs() * pd.to_numeric(out["Price"], errors="coerce")
+    if "Status" in out.columns:
+        _st = out["Status"].astype(str).str.upper().str.strip()
+        out["Status"] = _st.replace({"DONE":"completed"}).str.lower()
+    return out
+
+
+def _maybe_p2p_ru_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Additive, non-breaking mapper for RU/UA P2P CSV exports with columns like:
+    'Тип ордера','Крипта','Валюта','Цена','Объем','Сумма','Статус','Дата создания'.
+    Returns a copy with the standard columns populated, or df unchanged if not matched.
+    """
+    try:
+        cols = set(map(str, df.columns))
+    except Exception:
+        return df
+    needed = {"Тип ордера","Крипта","Валюта","Цена","Объем","Сумма","Статус","Дата создания"}
+    if not needed.issubset(cols):
+        return df
+    out = df.copy()
+    if "Created Time" not in out.columns and "Дата создания" in out.columns:
+        out["Created Time"] = out["Дата создания"]
+    if "Order Type" not in out.columns and "Тип ордера" in out.columns:
+        s = out["Тип ордера"].astype(str).str.strip().str.lower()
+        out["Order Type"] = s.replace({"купить":"Buy","продать":"Sell"})
+    if "Asset Type" not in out.columns and "Крипта" in out.columns:
+        out["Asset Type"] = out["Крипта"].astype(str).str.upper()
+    if "Fiat Type" not in out.columns and "Валюта" in out.columns:
+        out["Fiat Type"] = out["Валюта"].astype(str).str.upper()
+    if "Quantity" not in out.columns and "Объем" in out.columns:
+        out["Quantity"] = pd.to_numeric(out["Объем"], errors="coerce")
+    if "Price" not in out.columns and "Цена" in out.columns:
+        out["Price"] = pd.to_numeric(out["Цена"], errors="coerce")
+    if "Total Price" not in out.columns and "Сумма" in out.columns:
+        out["Total Price"] = pd.to_numeric(out["Сумма"], errors="coerce")
+    if "Status" not in out.columns and "Статус" in out.columns:
+        out["Status"] = out["Статус"]
+    if "Status" in out.columns:
+        st = out["Status"].astype(str).str.strip().str.lower()
+        out["Status"] = st.replace({
+            "выполнено":"completed",
+            "готово":"completed",
+            "успешно":"completed",
+            "отменено":"canceled",
+            "отмена":"canceled"
+        })
+    return out
+
+    """
+    Additive, non-breaking mapper for Trustee Plus .xls exports.
+    If columns match the Trustee Plus shape, populate the standard fields the bot expects.
+    Otherwise, return df unchanged.
+    """
+    try:
+        cols = set(map(str, df.columns))
+    except Exception:
+        try:
+            cols = set(df.columns.astype(str))
+        except Exception:
+            return df
+    needed = {"Date","Type","Status","Amount","Currency code","Currency code after swap","Rate"}
+    if not needed.issubset(cols):
+        return df
+    out = df.copy()
+    if "Created Time" not in out.columns and "Date" in out.columns:
+        out["Created Time"] = out["Date"]
+    if "Order Type" not in out.columns and "Type" in out.columns:
+        _side = out["Type"].astype(str).str.upper().str.strip()
+        out["Order Type"] = _side.replace({"DEPOSIT":"Buy","WITHDRAW":"Sell"})
+    if "Asset Type" not in out.columns and "Currency code" in out.columns:
+        out["Asset Type"] = out["Currency code"]
+    if "Fiat Type" not in out.columns and "Currency code after swap" in out.columns:
+        out["Fiat Type"] = out["Currency code after swap"]
+    if "Quantity" not in out.columns and "Amount" in out.columns:
+        out["Quantity"] = pd.to_numeric(out["Amount"], errors="coerce").abs()
+    if "Price" not in out.columns and "Rate" in out.columns:
+        out["Price"] = pd.to_numeric(out["Rate"], errors="coerce")
+    if "Total Price" not in out.columns and {"Quantity","Price"}.issubset(out.columns):
+        out["Total Price"] = pd.to_numeric(out["Quantity"], errors="coerce").abs() * pd.to_numeric(out["Price"], errors="coerce")
+    if "Status" in out.columns:
+        _st = out["Status"].astype(str).str.upper().str.strip()
+        out["Status"] = _st.replace({"DONE":"completed"}).str.lower()
+    return out
+
+
 from flask import Flask, request, redirect, url_for, session, render_template_string, abort
 
 from telegram import Update, constants, ForceReply, ReplyKeyboardMarkup, KeyboardButton
@@ -272,6 +390,8 @@ def _read_xls_with_xlrd_raw(file_bytes: bytes) -> pd.DataFrame:
     headers = [str(sh.cell_value(0,c)).strip() for c in range(sh.ncols)]
     rows = [[sh.cell_value(r,c) for c in range(sh.ncols)] for r in range(1, sh.nrows)]
     df = pd.DataFrame(rows, columns=headers)
+    df = _maybe_p2p_ru_csv(df)
+    df = _maybe_trustee_plus(df)
     return normalize_columns(df)
 
 def read_table(file_bytes: bytes, filename: str|None) -> pd.DataFrame:
@@ -280,26 +400,40 @@ def read_table(file_bytes: bytes, filename: str|None) -> pd.DataFrame:
     if sig=="zip":
         try:    df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
         except: df = pd.read_excel(io.BytesIO(file_bytes))
+        df = _maybe_p2p_ru_csv(df)
+        df = _maybe_trustee_plus(df)
         return normalize_columns(df)
     if sig=="ole":
         try:    df = pd.read_excel(io.BytesIO(file_bytes), engine="xlrd")
         except: df = _read_xls_with_xlrd_raw(file_bytes)
+        df = _maybe_p2p_ru_csv(df)
+        df = _maybe_trustee_plus(df)
         return normalize_columns(df)
     try:
         if name.endswith(".xlsx"):
-            df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl"); return normalize_columns(df)
+            df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl"); df = _maybe_p2p_ru_csv(df)
+        df = _maybe_trustee_plus(df)
+        return normalize_columns(df)
         if name.endswith(".xls"):
             try:    df = pd.read_excel(io.BytesIO(file_bytes), engine="xlrd")
             except: df = _read_xls_with_xlrd_raw(file_bytes)
-            return normalize_columns(df)
+            df = _maybe_p2p_ru_csv(df)
+        df = _maybe_trustee_plus(df)
+        return normalize_columns(df)
         if name.endswith(".csv"):
-            df = pd.read_csv(io.BytesIO(file_bytes)); return normalize_columns(df)
+            df = pd.read_csv(io.BytesIO(file_bytes)); df = _maybe_p2p_ru_csv(df)
+        df = _maybe_trustee_plus(df)
+        return normalize_columns(df)
     except Exception:
         pass
     try:
-        df = pd.read_excel(io.BytesIO(file_bytes)); return normalize_columns(df)
+        df = pd.read_excel(io.BytesIO(file_bytes)); df = _maybe_p2p_ru_csv(df)
+        df = _maybe_trustee_plus(df)
+        return normalize_columns(df)
     except Exception:
-        df = pd.read_csv(io.BytesIO(file_bytes)); return normalize_columns(df)
+        df = pd.read_csv(io.BytesIO(file_bytes)); df = _maybe_p2p_ru_csv(df)
+        df = _maybe_trustee_plus(df)
+        return normalize_columns(df)
 
 def _as_series(col):
     if isinstance(col, pd.DataFrame): return col.iloc[:,0]
@@ -673,7 +807,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state=="recalc" and text in ("USDT","USDC"):
         asset=text
-        trades_all = get_last_trades(uid, asset) or pd.DataFrame(columns=["Created Time","Order Type","Asset Type","Fiat Type","Quantity","Price","Total Price"])
+        tmp__df = get_last_trades(uid, asset)
+    if tmp__df is None or (isinstance(tmp__df, pd.DataFrame) and tmp__df.empty):
+        trades_all = pd.DataFrame(columns=["Created Time","Order Type","Asset Type","Fiat Type","Quantity","Price","Total Price"])
+    else:
+        trades_all = tmp__df
         manual     = get_manual_ops(uid, asset)
         if not manual.empty: trades_all = pd.concat([trades_all, manual], ignore_index=True).sort_values("Created Time")
         opening    = load_layers(uid, asset)
@@ -975,6 +1113,7 @@ def index():
 </div>
 """, users_total=users_total, blocked=blocked, queue_open=queue_open,
        last_rows=last_rows, qrows=qrows, active_24h=active_24h, tz=ADMIN_TZ)
+
 
 @app.route("/broadcast/quick", methods=["POST"])
 @login_required
