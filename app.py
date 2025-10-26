@@ -8,20 +8,12 @@ from typing import Deque, List, Optional, Tuple, Dict
 import pandas as pd
 from zoneinfo import ZoneInfo
 
-
+# === Additive mappers for extra export formats ===
 def _maybe_trustee_plus(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Additive, non-breaking mapper for Trustee Plus .xls exports.
-    If columns match the Trustee Plus shape, populate the standard fields the bot expects.
-    Otherwise, return df unchanged.
-    """
     try:
         cols = set(map(str, df.columns))
     except Exception:
-        try:
-            cols = set(df.columns.astype(str))
-        except Exception:
-            return df
+        return df
     needed = {"Date","Type","Status","Amount","Currency code","Currency code after swap","Rate"}
     if not needed.issubset(cols):
         return df
@@ -29,8 +21,8 @@ def _maybe_trustee_plus(df: pd.DataFrame) -> pd.DataFrame:
     if "Created Time" not in out.columns and "Date" in out.columns:
         out["Created Time"] = out["Date"]
     if "Order Type" not in out.columns and "Type" in out.columns:
-        _side = out["Type"].astype(str).str.upper().str.strip()
-        out["Order Type"] = _side.replace({"DEPOSIT":"Buy","WITHDRAW":"Sell"})
+        s = out["Type"].astype(str).str.upper().str.strip()
+        out["Order Type"] = s.replace({"DEPOSIT":"Buy","WITHDRAW":"Sell"})
     if "Asset Type" not in out.columns and "Currency code" in out.columns:
         out["Asset Type"] = out["Currency code"]
     if "Fiat Type" not in out.columns and "Currency code after swap" in out.columns:
@@ -42,17 +34,11 @@ def _maybe_trustee_plus(df: pd.DataFrame) -> pd.DataFrame:
     if "Total Price" not in out.columns and {"Quantity","Price"}.issubset(out.columns):
         out["Total Price"] = pd.to_numeric(out["Quantity"], errors="coerce").abs() * pd.to_numeric(out["Price"], errors="coerce")
     if "Status" in out.columns:
-        _st = out["Status"].astype(str).str.upper().str.strip()
-        out["Status"] = _st.replace({"DONE":"completed"}).str.lower()
+        st = out["Status"].astype(str).str.upper().str.strip()
+        out["Status"] = st.replace({"DONE":"completed"}).str.lower()
     return out
 
-
 def _maybe_p2p_ru_csv(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Additive, non-breaking mapper for RU/UA P2P CSV exports with columns like:
-    'Тип ордера','Крипта','Валюта','Цена','Объем','Сумма','Статус','Дата создания'.
-    Returns a copy with the standard columns populated, or df unchanged if not matched.
-    """
     try:
         cols = set(map(str, df.columns))
     except Exception:
@@ -81,50 +67,11 @@ def _maybe_p2p_ru_csv(df: pd.DataFrame) -> pd.DataFrame:
     if "Status" in out.columns:
         st = out["Status"].astype(str).str.strip().str.lower()
         out["Status"] = st.replace({
-            "выполнено":"completed",
-            "готово":"completed",
-            "успешно":"completed",
-            "отменено":"canceled",
-            "отмена":"canceled"
+            "выполнено":"completed","готово":"completed","успешно":"completed",
+            "отменено":"canceled","отмена":"canceled"
         })
     return out
-
-    """
-    Additive, non-breaking mapper for Trustee Plus .xls exports.
-    If columns match the Trustee Plus shape, populate the standard fields the bot expects.
-    Otherwise, return df unchanged.
-    """
-    try:
-        cols = set(map(str, df.columns))
-    except Exception:
-        try:
-            cols = set(df.columns.astype(str))
-        except Exception:
-            return df
-    needed = {"Date","Type","Status","Amount","Currency code","Currency code after swap","Rate"}
-    if not needed.issubset(cols):
-        return df
-    out = df.copy()
-    if "Created Time" not in out.columns and "Date" in out.columns:
-        out["Created Time"] = out["Date"]
-    if "Order Type" not in out.columns and "Type" in out.columns:
-        _side = out["Type"].astype(str).str.upper().str.strip()
-        out["Order Type"] = _side.replace({"DEPOSIT":"Buy","WITHDRAW":"Sell"})
-    if "Asset Type" not in out.columns and "Currency code" in out.columns:
-        out["Asset Type"] = out["Currency code"]
-    if "Fiat Type" not in out.columns and "Currency code after swap" in out.columns:
-        out["Fiat Type"] = out["Currency code after swap"]
-    if "Quantity" not in out.columns and "Amount" in out.columns:
-        out["Quantity"] = pd.to_numeric(out["Amount"], errors="coerce").abs()
-    if "Price" not in out.columns and "Rate" in out.columns:
-        out["Price"] = pd.to_numeric(out["Rate"], errors="coerce")
-    if "Total Price" not in out.columns and {"Quantity","Price"}.issubset(out.columns):
-        out["Total Price"] = pd.to_numeric(out["Quantity"], errors="coerce").abs() * pd.to_numeric(out["Price"], errors="coerce")
-    if "Status" in out.columns:
-        _st = out["Status"].astype(str).str.upper().str.strip()
-        out["Status"] = _st.replace({"DONE":"completed"}).str.lower()
-    return out
-
+# === end mappers ===
 
 from flask import Flask, request, redirect, url_for, session, render_template_string, abort
 
@@ -807,11 +754,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state=="recalc" and text in ("USDT","USDC"):
         asset=text
-        tmp__df = get_last_trades(uid, asset)
-    if tmp__df is None or (isinstance(tmp__df, pd.DataFrame) and tmp__df.empty):
-        trades_all = pd.DataFrame(columns=["Created Time","Order Type","Asset Type","Fiat Type","Quantity","Price","Total Price"])
-    else:
-        trades_all = tmp__df
+        trades_all__tmp = get_last_trades(uid, asset)
+        if trades_all__tmp is None or (isinstance(trades_all__tmp, pd.DataFrame) and trades_all__tmp.empty):
+            trades_all = pd.DataFrame(columns=["Created Time","Order Type","Asset Type","Fiat Type","Quantity","Price","Total Price"])
+        else:
+            trades_all = trades_all__tmp
         manual     = get_manual_ops(uid, asset)
         if not manual.empty: trades_all = pd.concat([trades_all, manual], ignore_index=True).sort_values("Created Time")
         opening    = load_layers(uid, asset)
@@ -874,7 +821,9 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         any_asset=True
         set_last_trades(uid, asset, trades)
         opening = load_layers(uid, asset)
-        summary,_ = build_summary_asset(asset, trades, opening)
+        summary, ending_layers = build_summary_asset(asset, trades, opening)
+        if summary.shortage_qty <= 1e-12:
+            save_layers(uid, ending_layers, asset)
         lines = [
             f"<b>{asset} — баланс/отчёт</b>",
             f"• Покупка, кол-во: {summary.buy_qty:.2f} {asset}",
