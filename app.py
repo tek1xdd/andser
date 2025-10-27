@@ -272,7 +272,7 @@ def reset_fiat_balance(user_id: str, currency: str = FIAT):
     con = db(); con.execute("DELETE FROM fiat_balance WHERE user_id=? AND currency=?", (user_id, currency)); con.commit(); con.close()
 
 ALT_MAP = {
-    "Created Time": ["Created Time","Time","Date(UTC)","Order Time","Create Time"],
+    "Created Time": ["Created Time","Time","Date(UTC)","Order Time","Create Time","Match time(UTC)","Match Time","Matched Time"],
     "Order Type":   ["Order Type","Side","Type"],
     "Status":       ["Status","Order Status","Trade Status"],
     "Asset Type":   ["Asset Type","Asset","Crypto","Base","Cryptocurrency"],
@@ -684,25 +684,70 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid in ожидание_RECALC and uid not in ожидание_FORM:
         price = _to_float(text)
         if not price or price <= 0:
-            await m.reply_text("Нужно положительное число (цена). Пример: 39.00"); return
+            await m.reply_text("Нужно положительное число (цена). Пример: 39.00"); return        
+
         data = ожидание_RECALC.pop(uid)
-        asset, qty = data["asset"], float(data["qty"])
+        asset, qty = data["asset"], float(data["qty"])        
+
         trades_all__tmp = get_last_trades(uid, asset)
         if trades_all__tmp is None or (isinstance(trades_all__tmp, pd.DataFrame) and trades_all__tmp.empty):
-            await m.reply_text(f"Нет последней выписки по {asset}. Сначала отправьте файл.", reply_markup=kb_main()); return
+            await m.reply_text(f"Нет последней выписки по {asset}. Сначала отправьте файл.", reply_markup=kb_main()); return        
+
         trades_all = trades_all__tmp
         manual = get_manual_ops(uid, asset)
         if manual is not None and not manual.empty:
-            trades_all = pd.concat([trades_all, manual], ignore_index=True).sort_values("Created Time")
-        opening = load_layers(uid, asset)
-        summary, ending_layers = build_summary_asset(asset, trades_all, opening + [(qty, price)])
-        if summary.cogs_fifo_uah is not None:
-            save_layers(uid, ending_layers, asset)
-        out = (f"<b>Перерасчёт остатка ({asset})</b>"
-               f"• Себестоимость проданного (FIFO): {fmt_opt(summary.cogs_fifo_uah)} {FIAT}"
-               f"• Прибыль (FIFO): {fmt_opt(summary.realized_pnl_fifo_uah)} {FIAT}"
-               f"• Конечный остаток: {summary.end_qty:.2f} {asset}")
-        await m.reply_text(out, reply_markup=kb_main()); return
+            trades_all = pd.concat([trades_all, manual], ignore_index=True).sort_values("Created Time")        
+
+        opening = load_layers(uid, asset)        
+
+        # Добавляем «прошлую» среднюю цену как стартовый слой
+        summary, ending_layers = build_summary_asset(asset, trades_all, opening + [(qty, price)])        
+
+        EPS = 1e-6  # допускаем микроскопические хвосты из-за округлений
+        if summary.shortage_qty is not None and summary.shortage_qty <= EPS:
+            summary.shortage_qty = 0.0        
+
+        # Если после добавления слоя дефицита уже нет — сохраняем слои
+        if (summary.shortage_qty or 0.0) == 0.0:
+            if summary.cogs_fifo_uah is None:
+                # подстраховка (на всякий случай считаем вручную)
+                sell_qty = summary.sell_qty or 0.0
+                buy_qty  = summary.buy_qty or 0.0
+                file_avg = summary.avg_buy_price or 0.0
+                cogs_file    = min(sell_qty, buy_qty) * file_avg
+                deficit_file = max(0.0, sell_qty - buy_qty)
+                cogs_balance = min(deficit_file, qty) * price
+                summary.cogs_fifo_uah = cogs_file + cogs_balance
+                summary.realized_pnl_fifo_uah = (summary.sum_sells_uah or 0.0) - (summary.cogs_fifo_uah or 0.0)        
+
+            save_layers(uid, ending_layers, asset)        
+
+        else:
+            # Дефицит всё еще остался (введённого «прошлого» количества не хватило)
+            sell_qty = summary.sell_qty or 0.0
+            buy_qty  = summary.buy_qty or 0.0
+            file_avg = summary.avg_buy_price or 0.0        
+
+            cogs_file    = min(sell_qty, buy_qty) * file_avg
+            deficit_file = max(0.0, sell_qty - buy_qty)
+            # учитываем только ту часть дефицита, которую покрыли введённой ценой
+            covered = min(deficit_file, qty)
+            cogs_balance = covered * price        
+
+            summary.cogs_fifo_uah = cogs_file + cogs_balance
+            summary.realized_pnl_fifo_uah = (summary.sum_sells_uah or 0.0) - (summary.cogs_fifo_uah or 0.0)        
+
+        # Ответ пользователю — всегда показываем COGS/PNL; если дефицит остался, добавляем строку-подсказку
+        lines = [
+            f"<b>Перерасчёт остатка ({asset})</b>",
+            f"• Себестоимость проданного (FIFO): {fmt_opt(summary.cogs_fifo_uah)} {FIAT}",
+            f"• Прибыль (FIFO): {fmt_opt(summary.realized_pnl_fifo_uah)} {FIAT}",
+            f"• Конечный остаток: {summary.end_qty:.2f} {asset}",
+        ]
+        if (summary.shortage_qty or 0.0) > 0.0:
+            lines.insert(1, f"• Остаточный дефицит: {summary.shortage_qty:.2f} {asset} (добавь ещё «прошлой» суммы)")        
+
+        await m.reply_text("\n".join(lines), reply_markup=kb_main())
 
     if uid in ожидание_FORM:
         flow = ожидание_FORM[uid]; t=flow["type"]; step=flow["step"]; asset=flow.get("asset"); data=flow["data"]
@@ -856,34 +901,26 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         raw_df = read_table(file_bytes, filename)
     except Exception as e:
-        await update.message.reply_text(f"Ошибка чтения файла: {ihtml.escape(str(e))}", reply_markup=kb_main()); return
+        await update.message.reply_text(f"Ошибка чтения файла: {ihtml.escape(str(e))}", reply_markup=kb_main()); 
+        return
 
-    any_asset=False
+    any_asset = False
     for asset in ASSETS:
         trades = extract_asset_trades(raw_df, asset)
-        if trades is None or trades.empty: continue
-        any_asset=True
+        if trades is None or trades.empty:
+            continue
+
+        any_asset = True
         set_last_trades(uid, asset, trades)
+
         opening = load_layers(uid, asset)
         summary, ending_layers = build_summary_asset(asset, trades, opening)
-        open_qty, open_avg = _layers_avg(opening)
-        buy_qty = summary.buy_qty or 0.0
-        sell_qty = summary.sell_qty or 0.0
-        file_avg = summary.avg_buy_price or 0.0
-        deficit = max(0.0, sell_qty - buy_qty)
-        cogs_file = min(sell_qty, buy_qty) * file_avg
-        cogs_balance = deficit * (open_avg or 0.0)
-        summary.cogs_fifo_uah = cogs_file + cogs_balance
-        summary.realized_pnl_fifo_uah = (summary.sum_sells_uah or 0.0) - (summary.cogs_fifo_uah or 0.0)
-        remain_open_qty = max(0.0, open_qty - deficit)
-        remain_open_cost = remain_open_qty * (open_avg or 0.0)
-        leftover_file_qty = max(0.0, buy_qty - sell_qty)
-        leftover_file_cost = leftover_file_qty * file_avg
-        new_qty = remain_open_qty + leftover_file_qty
-        new_avg = ((remain_open_cost + leftover_file_cost)/new_qty) if new_qty else None
-        ending_layers = [(new_qty, new_avg or 0.0)] if new_qty else []
+
+        # ⛔ Больше НИКАКИХ ручных COGS/PNL тут — всё оставляем на «Перерасчёт».
+        # Сохраняем слои только если дефицита нет:
         if summary.shortage_qty <= 1e-12:
             save_layers(uid, ending_layers, asset)
+
         lines = [
             f"<b>{asset} — баланс/отчёт</b>",
             f"• Покупка, кол-во: {summary.buy_qty:.2f} {asset}",
@@ -893,13 +930,19 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Сумма покупок (по файлу): {summary.sum_buys_uah:.2f} {FIAT}",
             f"• Сумма продаж (файл+ручн.): {summary.sum_sells_uah:.2f} {FIAT}",
             f"• Денежный поток (файл+ручн.): {summary.cash_flow_uah:.2f} {FIAT}",
-            *(["• Себестоимость проданного (FIFO): " + fmt_opt(summary.cogs_fifo_uah) + f" {FIAT}"] if summary.cogs_fifo_uah is not None else []),
-            *(["• Прибыль (FIFO): " + fmt_opt(summary.realized_pnl_fifo_uah) + f" {FIAT}"] if summary.realized_pnl_fifo_uah is not None else []),
-            f"• Конечный остаток: {summary.end_qty:.2f} {asset}"
         ]
-        if summary.note: lines.append("\n"+ihtml.escape(summary.note))
+        if summary.cogs_fifo_uah is not None:
+            lines += [
+                f"• Себестоимость проданного (FIFO): {fmt_opt(summary.cogs_fifo_uah)} {FIAT}",
+                f"• Прибыль (FIFO): {fmt_opt(summary.realized_pnl_fifo_uah)} {FIAT}",
+            ]
+        lines.append(f"• Конечный остаток: {summary.end_qty:.2f} {asset}")
+        if summary.note:
+            lines.append("\n" + ihtml.escape(summary.note))
+
         await update.message.reply_text("\n".join(lines), reply_markup=kb_main())
 
+    # UAH→UAH операции
     uah_ops = extract_uah_ops(raw_df)
     if not uah_ops.empty:
         uah_sum = process_uah_ops(uid, uah_ops)
@@ -916,6 +959,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Готово. Выберите действие:", reply_markup=kb_main())
     else:
         await update.message.reply_text("Выберите действие:", reply_markup=kb_main())
+
 
 def _parse_utc_storage(s: str) -> datetime:
     try: dt = datetime.fromisoformat(s)
@@ -1327,4 +1371,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
