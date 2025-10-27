@@ -872,24 +872,36 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_last_trades(uid, asset, trades)
         opening = load_layers(uid, asset)
         summary, ending_layers = build_summary_asset(asset, trades, opening)
+
+        # ✅ NEW: пересчитываем COGS/Profit ТОЛЬКО если есть дефицит и стартовый слой НЕ нулевой.
         open_qty, open_avg = _layers_avg(opening)
-        buy_qty = summary.buy_qty or 0.0
+        buy_qty  = summary.buy_qty  or 0.0
         sell_qty = summary.sell_qty or 0.0
         file_avg = summary.avg_buy_price or 0.0
-        deficit = max(0.0, sell_qty - buy_qty)
-        cogs_file = min(sell_qty, buy_qty) * file_avg
-        cogs_balance = deficit * (open_avg or 0.0)
-        summary.cogs_fifo_uah = cogs_file + cogs_balance
-        summary.realized_pnl_fifo_uah = (summary.sum_sells_uah or 0.0) - (summary.cogs_fifo_uah or 0.0)
-        remain_open_qty = max(0.0, open_qty - deficit)
+        deficit  = max(0.0, sell_qty - buy_qty)
+
+        if (summary.cogs_fifo_uah is None                 # ядро вернуло None из-за дефицита
+            and deficit > 1e-12                           # действительно есть дефицит
+            and (open_avg is not None and open_qty > 1e-12)):  # стартовый баланс не нулевой
+            cogs_file    = min(sell_qty, buy_qty) * file_avg
+            cogs_balance = deficit * open_avg
+            summary.cogs_fifo_uah = cogs_file + cogs_balance
+            summary.realized_pnl_fifo_uah = (summary.sum_sells_uah or 0.0) - summary.cogs_fifo_uah
+        # Если старт нулевой — не трогаем summary.* (пусть останется None и пользователь сделает «Перерасчёт»).
+
+        # Сборка конечных слоёв в один агрегированный слой (остаток старта + остаток покупок файла)
+        remain_open_qty  = max(0.0, open_qty - deficit)
         remain_open_cost = remain_open_qty * (open_avg or 0.0)
-        leftover_file_qty = max(0.0, buy_qty - sell_qty)
+        leftover_file_qty  = max(0.0, buy_qty - sell_qty)
         leftover_file_cost = leftover_file_qty * file_avg
         new_qty = remain_open_qty + leftover_file_qty
         new_avg = ((remain_open_cost + leftover_file_cost)/new_qty) if new_qty else None
         ending_layers = [(new_qty, new_avg or 0.0)] if new_qty else []
+
+        # Сохраняем слои только если дефицита нет вообще
         if summary.shortage_qty <= 1e-12:
             save_layers(uid, ending_layers, asset)
+
         lines = [
             f"<b>{asset} — баланс/отчёт</b>",
             f"• Покупка, кол-во: {summary.buy_qty:.2f} {asset}",
@@ -899,8 +911,10 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Сумма покупок (по файлу): {summary.sum_buys_uah:.2f} {FIAT}",
             f"• Сумма продаж (файл+ручн.): {summary.sum_sells_uah:.2f} {FIAT}",
             f"• Денежный поток (файл+ручн.): {summary.cash_flow_uah:.2f} {FIAT}",
-            *(["• Себестоимость проданного (FIFO): " + fmt_opt(summary.cogs_fifo_uah) + f" {FIAT}"] if summary.cogs_fifo_uah is not None else []),
-            *(["• Прибыль (FIFO): " + fmt_opt(summary.realized_pnl_fifo_uah) + f" {FIAT}"] if summary.realized_pnl_fifo_uah is not None else []),
+            *(["• Себестоимость проданного (FIFO): " + fmt_opt(summary.cogs_fifo_uah) + f" {FIAT}"]
+              if summary.cogs_fifo_uah is not None else []),
+            *(["• Прибыль (FIFO): " + fmt_opt(summary.realized_pnl_fifo_uah) + f" {FIAT}"]
+              if summary.realized_pnl_fifo_uah is not None else []),
             f"• Конечный остаток: {summary.end_qty:.2f} {asset}"
         ]
         if summary.note: lines.append("\n"+ihtml.escape(summary.note))
