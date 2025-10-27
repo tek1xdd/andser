@@ -8,7 +8,6 @@ from typing import Deque, List, Optional, Tuple, Dict
 import pandas as pd
 from zoneinfo import ZoneInfo
 
-# === Additive mappers for extra export formats ===
 def _maybe_trustee_plus(df: pd.DataFrame) -> pd.DataFrame:
     try:
         cols = set(map(str, df.columns))
@@ -71,7 +70,7 @@ def _maybe_p2p_ru_csv(df: pd.DataFrame) -> pd.DataFrame:
             "отменено":"canceled","отмена":"canceled"
         })
     return out
-# === end mappers ===
+
 
 from flask import Flask, request, redirect, url_for, session, render_template_string, abort
 
@@ -386,21 +385,51 @@ def _as_series(col):
     if isinstance(col, pd.DataFrame): return col.iloc[:,0]
     return col
 
+
 def extract_asset_trades(df: pd.DataFrame, asset: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["Created Time","Order Type","Asset Type","Fiat Type","Quantity","Price","Total Price"])
     status_col = _as_series(df.get("Status"))
     ok_mask = True
-    if status_col is not None and isinstance(status_col, (pd.Series, pd.DataFrame)):
-        ok_mask = _as_series(status_col).astype(str).str.strip().str.lower().isin(["completed","готово","filled"])
-    asset_col = _as_series(df.get("Asset Type",""))
-    asset_mask = _as_series(asset_col).astype(str).str.upper().str.strip()==asset
+    if isinstance(status_col, (pd.Series, pd.DataFrame)):
+        ok_values = {"completed","готово","filled","done","success","выполнено","успешно","завершено"}
+        ok_mask = _as_series(status_col).astype(str).str.strip().str.lower().isin(ok_values)
+
+    asset_series = None
+    for cand in ["Asset Type","Крипта","Currency code","Cryptocurrency","Монета","Token","Токен"]:
+        if cand in df.columns:
+            asset_series = _as_series(df[cand]); break
+    if asset_series is None:
+        for cand in ["Pair","Symbol","Market","Instrument","Пара","Инструмент"]:
+            if cand in df.columns:
+                s = _as_series(df[cand]).astype(str).str.upper()
+                s = s.str.replace(r"[\s—–\-→\\]+", "/", regex=True)
+                asset_series = s.str.split("/").str[0]
+                break
+    if asset_series is None:
+        return pd.DataFrame(columns=["Created Time","Order Type","Asset Type","Fiat Type","Quantity","Price","Total Price"])
+
+    asset_mask = asset_series.astype(str).str.upper().str.strip()==asset
     mask = asset_mask & ok_mask
+
     cols = ["Created Time","Order Type","Asset Type","Fiat Type","Quantity","Price","Total Price"]
-    out = df.loc[mask, cols].copy()
+    present = [c for c in cols if c in df.columns]
+    out = df.loc[mask, present].copy()
+    for c in cols:
+        if c not in out.columns:
+            out[c] = pd.Series([None]*len(out))
+
     out["Created Time"] = pd.to_datetime(_as_series(out["Created Time"]), errors="coerce")
-    out = out.dropna(subset=["Created Time","Quantity","Price","Total Price"])
-    out["Order Type"] = _as_series(out["Order Type"]).astype(str).str.title()
+    out = out.dropna(subset=["Created Time"])
+
+    for c in ["Quantity","Price","Total Price"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.dropna(subset=["Quantity","Price","Total Price"], how="any")
+
+    out["Order Type"] = _as_series(out["Order Type"]).astype(str).str.strip().str.title()
+    out["Order Type"] = out["Order Type"].replace({"Покупка":"Buy","Купівля":"Buy","Продажа":"Sell","Продаж":"Sell"})
+
     return out.sort_values("Created Time").reset_index(drop=True)
 
 def is_uah_uah_row(row) -> bool:
@@ -462,6 +491,15 @@ def layers_totals(layers: List[Tuple[float,float]]):
     avg = (cost/qty) if qty>1e-12 else None
     return qty, cost, avg
 
+
+def _layers_avg(layers):
+
+    try:
+        total_qty = sum(q for q,_ in layers) if layers else 0.0
+        total_cost = sum(q*p for q,p in layers) if layers else 0.0
+        return total_qty, (total_cost/total_qty if total_qty else None)
+    except Exception:
+        return 0.0, None
 def build_summary_asset(asset: str, trades: pd.DataFrame, opening_layers: List[Tuple[float,float]]):
     buy  = trades[trades["Order Type"]=="Buy"]  if "Order Type" in trades else pd.DataFrame(columns=trades.columns)
     sell = trades[trades["Order Type"]=="Sell"] if "Order Type" in trades else pd.DataFrame(columns=trades.columns)
@@ -649,14 +687,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await m.reply_text("Нужно положительное число (цена). Пример: 39.00"); return
         data = ожидание_RECALC.pop(uid)
         asset, qty = data["asset"], float(data["qty"])
-        trades = get_last_trades(uid, asset)
-        if trades is None or trades.empty:
+        trades_all__tmp = get_last_trades(uid, asset)
+        if trades_all__tmp is None or (isinstance(trades_all__tmp, pd.DataFrame) and trades_all__tmp.empty):
             await m.reply_text(f"Нет последней выписки по {asset}. Сначала отправьте файл.", reply_markup=kb_main()); return
-        summary, ending_layers = build_summary_asset(asset, trades, [(qty, price)])
-        if summary.cogs_fifo_uah is not None: save_layers(uid, ending_layers, asset)
-        out = (f"<b>Перерасчёт остатка ({asset})</b>\n"
-               f"• Себестоимость проданного (FIFO): {fmt_opt(summary.cogs_fifo_uah)} {FIAT}\n"
-               f"• Прибыль (FIFO): {fmt_opt(summary.realized_pnl_fifo_uah)} {FIAT}\n"
+        trades_all = trades_all__tmp
+        manual = get_manual_ops(uid, asset)
+        if manual is not None and not manual.empty:
+            trades_all = pd.concat([trades_all, manual], ignore_index=True).sort_values("Created Time")
+        opening = load_layers(uid, asset)
+        summary, ending_layers = build_summary_asset(asset, trades_all, opening + [(qty, price)])
+        if summary.cogs_fifo_uah is not None:
+            save_layers(uid, ending_layers, asset)
+        out = (f"<b>Перерасчёт остатка ({asset})</b>"
+               f"• Себестоимость проданного (FIFO): {fmt_opt(summary.cogs_fifo_uah)} {FIAT}"
+               f"• Прибыль (FIFO): {fmt_opt(summary.realized_pnl_fifo_uah)} {FIAT}"
                f"• Конечный остаток: {summary.end_qty:.2f} {asset}")
         await m.reply_text(out, reply_markup=kb_main()); return
 
@@ -822,6 +866,22 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_last_trades(uid, asset, trades)
         opening = load_layers(uid, asset)
         summary, ending_layers = build_summary_asset(asset, trades, opening)
+        open_qty, open_avg = _layers_avg(opening)
+        buy_qty = summary.buy_qty or 0.0
+        sell_qty = summary.sell_qty or 0.0
+        file_avg = summary.avg_buy_price or 0.0
+        deficit = max(0.0, sell_qty - buy_qty)
+        cogs_file = min(sell_qty, buy_qty) * file_avg
+        cogs_balance = deficit * (open_avg or 0.0)
+        summary.cogs_fifo_uah = cogs_file + cogs_balance
+        summary.realized_pnl_fifo_uah = (summary.sum_sells_uah or 0.0) - (summary.cogs_fifo_uah or 0.0)
+        remain_open_qty = max(0.0, open_qty - deficit)
+        remain_open_cost = remain_open_qty * (open_avg or 0.0)
+        leftover_file_qty = max(0.0, buy_qty - sell_qty)
+        leftover_file_cost = leftover_file_qty * file_avg
+        new_qty = remain_open_qty + leftover_file_qty
+        new_avg = ((remain_open_cost + leftover_file_cost)/new_qty) if new_qty else None
+        ending_layers = [(new_qty, new_avg or 0.0)] if new_qty else []
         if summary.shortage_qty <= 1e-12:
             save_layers(uid, ending_layers, asset)
         lines = [
@@ -833,6 +893,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Сумма покупок (по файлу): {summary.sum_buys_uah:.2f} {FIAT}",
             f"• Сумма продаж (файл+ручн.): {summary.sum_sells_uah:.2f} {FIAT}",
             f"• Денежный поток (файл+ручн.): {summary.cash_flow_uah:.2f} {FIAT}",
+            *(["• Себестоимость проданного (FIFO): " + fmt_opt(summary.cogs_fifo_uah) + f" {FIAT}"] if summary.cogs_fifo_uah is not None else []),
+            *(["• Прибыль (FIFO): " + fmt_opt(summary.realized_pnl_fifo_uah) + f" {FIAT}"] if summary.realized_pnl_fifo_uah is not None else []),
             f"• Конечный остаток: {summary.end_qty:.2f} {asset}"
         ]
         if summary.note: lines.append("\n"+ihtml.escape(summary.note))
