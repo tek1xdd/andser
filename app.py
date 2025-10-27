@@ -172,8 +172,8 @@ def upsert_user_from_telegram(u) -> None:
     con = db(); cur = con.cursor()
     now = datetime.utcnow().isoformat()
     cur.execute("""
-        INSERT INTO users (user_id, first_name, last_name, username, created_at, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO users (user_id, first_name, last_name, username, created_at, last_seen, is_blocked)
+        VALUES (?, ?, ?, ?, ?, ?, 1)
         ON CONFLICT(user_id) DO UPDATE SET
             first_name=excluded.first_name,
             last_name =excluded.last_name,
@@ -1327,3 +1327,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
